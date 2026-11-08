@@ -120,6 +120,7 @@ def new_half(config: AgentConfig, memory: dict) -> None:
     memory["eq_key"] = None
     memory["eq"] = 0.5
     memory["eq_level"] = 0
+    memory["samples"] = None
     memory["pf"] = [list(row) for row in _PF_PRIOR]
     memory["post"] = [[list(row) for row in _POST_PRIOR] for _ in range(3)]
     memory["line"] = []
@@ -222,8 +223,12 @@ def _partial_score(hole, board) -> int:
     return _best_with_board_masks(hole, _masks_for(board))
 
 
-def _equity(hole, board, seed: int, nrun: int, nopp: int, weights=None) -> float:
-    """Showdown equity of `hole`. `weights` reweights opponent classes."""
+def _equity(hole, board, seed: int, nrun: int, nopp: int, weights=None, out=None) -> float:
+    """Showdown equity of `hole`. `weights` reweights opponent classes.
+
+    If `out` is a list, each sampled opponent hand is appended to it as
+    (its made hand now, our points against it, its weight).
+    """
     bits = _BITS
     used = 0
     for c in hole:
@@ -232,7 +237,7 @@ def _equity(hole, board, seed: int, nrun: int, nopp: int, weights=None) -> float
         used |= bits[c]
     deck = [c for c in range(36) if (used & bits[c]) == 0]
     need = 5 - len(board)
-    cur_masks = _masks_for(board) if weights is not None and board else None
+    cur_masks = _masks_for(board) if board and (weights is not None or out is not None) else None
     rng = random.Random(seed)
     won = 0.0
     seen = 0.0
@@ -245,23 +250,24 @@ def _equity(hole, board, seed: int, nrun: int, nopp: int, weights=None) -> float
         for _opp in range(nopp):
             opp = rng.sample(rest, 5)
             theirs = _best_with_board_masks(opp, masks)
+            now = _best_with_board_masks(opp, cur_masks) if cur_masks is not None else 0
             if weights is None:
                 weight = 1.0
             elif cur_masks is None:
                 weight = weights[_pf_bucket(opp)]
             else:
-                weight = weights[_made_bucket(_best_with_board_masks(opp, cur_masks))]
+                weight = weights[_made_bucket(now)]
+            points = 1.0 if mine > theirs else 0.5 if mine == theirs else 0.0
             seen += weight
-            if mine > theirs:
-                won += weight
-            elif mine == theirs:
-                won += 0.5 * weight
+            won += points * weight
+            if out is not None:
+                out.append((now, points, weight))
     if seen <= 0.0:
         return 0.5
     return won / seen
 
 
-def _river_equity(hole, board, seed: int, samples: int, weights=None) -> float:
+def _river_equity(hole, board, seed: int, samples: int, weights=None, out=None) -> float:
     """River equity. Every opponent pair is scored once, then hands are sampled."""
     table = _TABLE
     bits = _BITS
@@ -296,14 +302,39 @@ def _river_equity(hole, board, seed: int, samples: int, weights=None) -> float:
             if score > best:
                 best = score
         weight = 1.0 if weights is None else weights[_made_bucket(best)]
+        points = 1.0 if mine > best else 0.5 if mine == best else 0.0
         seen += weight
-        if mine > best:
-            won += weight
-        elif mine == best:
-            won += 0.5 * weight
+        won += points * weight
+        if out is not None:
+            out.append((best, points, weight))
     if seen <= 0.0:
         return 0.5
     return won / seen
+
+
+def _calling_equity(samples, fold: float, fallback: float) -> float:
+    """Our equity against the hands that do not fold to a bet.
+
+    The opponent's hands are ranked by what they hold now, and the weakest
+    `fold` share of the weighted range is assumed to give up.
+    """
+    if not samples:
+        return fallback
+    total = 0.0
+    for _, _, weight in samples:
+        total += weight
+    if total <= 0.0:
+        return fallback
+    keep = total * max(0.05, 1.0 - fold)
+    taken = 0.0
+    won = 0.0
+    for _, points, weight in sorted(samples, key=lambda s: s[0], reverse=True):
+        part = min(weight, keep - taken)
+        if part <= 0.0:
+            break
+        taken += part
+        won += part * points
+    return won / taken if taken > 0.0 else fallback
 
 
 def _opp_kind(obs: Observation) -> int | None:
@@ -363,14 +394,16 @@ def _raw_equity(obs: Observation, memory: dict) -> float:
     seed &= 0xFFFFFFFF
     budget, river_n, _ = _TIERS[memory["tier"]]
     n_board = len(obs.board)
+    samples = [] if n_board else None
     if n_board == 5:
-        eq = _river_equity(obs.hole_cards, obs.board, seed, river_n, weights)
+        eq = _river_equity(obs.hole_cards, obs.board, seed, river_n, weights, samples)
     else:
         nrun, nopp = budget[n_board]
-        eq = _equity(obs.hole_cards, obs.board, seed, nrun, nopp, weights)
+        eq = _equity(obs.hole_cards, obs.board, seed, nrun, nopp, weights, samples)
     memory["eq_key"] = key
     memory["eq"] = eq
     memory["eq_level"] = 1
+    memory["samples"] = samples
     return eq
 
 
@@ -382,11 +415,12 @@ def _refine_raw(obs: Observation, memory: dict, raw: float, odds: float) -> floa
     seed = (obs.hand_index + 9) * 333 + int(obs.street) * 17 + 12345
     budget, _, refine_n = _TIERS[memory["tier"]]
     n_board = len(obs.board)
+    samples = memory["samples"]
     if n_board == 5:
-        extra = _river_equity(obs.hole_cards, obs.board, seed, refine_n, weights)
+        extra = _river_equity(obs.hole_cards, obs.board, seed, refine_n, weights, samples)
     else:
         nrun, nopp = budget[n_board]
-        extra = _equity(obs.hole_cards, obs.board, seed, nrun, nopp, weights)
+        extra = _equity(obs.hole_cards, obs.board, seed, nrun, nopp, weights, samples)
     mixed = 0.5 * (raw + extra)
     memory["eq"] = mixed
     memory["eq_level"] = 2
@@ -505,50 +539,60 @@ def _preflop(obs: Observation, eq: float, memory: dict) -> Action:
     return _prefer(obs, [Action.FOLD])
 
 
+def _raise_value(obs: Observation, memory: dict, eq: float, fold: float, added: int, called: int) -> float:
+    """Chips from a raise: the pot when they fold, a showdown when they call.
+
+    When they call, we face only the stronger part of their range. A raise
+    that is not all-in can still be raised back, so it gives up a little.
+    """
+    eq_call = _calling_equity(memory["samples"], fold, eq)
+    if added < obs.my_stack:
+        eq_call = max(0.0, eq_call - 0.02)
+    showdown = eq_call * (obs.pot + added + called) - added
+    return fold * obs.pot + (1.0 - fold) * showdown - 0.05
+
+
 def _postflop(obs: Observation, raw: float, memory: dict) -> Action:
     odds = _pot_odds(obs)
     eq = _refine_raw(obs, memory, raw, odds) if obs.to_call > 0 else raw
     aggro = _aggro(memory)
     f2b = _fold_to_bet(memory)
-    ip = obs.is_button
     spr = obs.my_stack / max(1, obs.pot)
     clean = _clean_raises(obs)
-    station = memory["bets"] >= 18 and f2b < 0.18
     maniac = aggro > 0.72 and f2b < 0.20 and memory["hands"] >= 16
 
     if obs.to_call == 0:
+        # A fixed 0.66 cutoff only bets the nuts, so a check tells a range-cutter
+        # we are weak. Compare the chips from checking with the chips from each
+        # raise: folds win the pot now, calls are the stronger part of the range.
+        check_value = eq * obs.pot * (1.0 if obs.street == Street.RIVER else 0.90)
+        best_value, best = check_value, Action.CHECK_CALL
+        fold = f2b
         if maniac:
-            pot_at, half_at = 0.57, 0.51
-        elif station:
-            pot_at, half_at = 0.60, 0.505
-        else:
-            pot_at, half_at = 0.66, 0.545
-        if ip:
-            pot_at -= 0.015
-            half_at -= 0.015
-        if spr < 2.2:
-            pot_at -= 0.03
-        if eq >= pot_at and Action.RAISE_POT in clean:
-            return _mark_bet(memory, Action.RAISE_POT)
-        if eq >= half_at and Action.RAISE_HALF in clean:
-            return _mark_bet(memory, Action.RAISE_HALF)
-        # Bluff only after this opponent has actually folded to bets.
-        if clean and memory["bets"] >= 10 and f2b > 0.40 and obs.raises_this_street == 0:
-            freq = min(0.88, (f2b - 0.32) * 1.7)
-            if ip:
-                freq = min(0.92, freq + 0.08)
-            salt = _mix(obs.hand_index, int(obs.street), obs.pot, obs.hole_cards[0], obs.hole_cards[-1])
-            if salt < freq:
-                action = Action.RAISE_POT if (f2b > 0.62 and Action.RAISE_POT in clean and salt < freq * 0.45) else (
-                    Action.RAISE_HALF if Action.RAISE_HALF in clean else Action.RAISE_POT
-                )
-                return _mark_bet(memory, action)
+            fold = min(fold, 0.12)
+        for action in clean:
+            added = obs.raise_to[action] - obs.my_bet
+            called = obs.raise_to[action] - obs.opp_bet
+            value = _raise_value(obs, memory, eq, fold, added, called)
+            if value > best_value:
+                best_value, best = value, action
+        if best in _RAISES:
+            return _mark_bet(memory, best)
         return Action.CHECK_CALL
 
-    if eq >= max(0.74, odds + 0.20) and obs.raises_this_street < 3 and Action.RAISE_POT in clean:
-        return _mark_bet(memory, Action.RAISE_POT)
-    if eq >= max(0.63, odds + 0.12) and obs.raises_this_street < 3 and Action.RAISE_HALF in clean:
-        return _mark_bet(memory, Action.RAISE_HALF)
+    # Raise over their bet only when it beats calling in chips. A player who
+    # already bet folds less to a raise than to our first bet.
+    if obs.raises_this_street < 3 and eq >= 0.55:
+        call_value = eq * (obs.pot + obs.to_call) - obs.to_call
+        best_value, best = max(call_value, 0.0), None
+        for action in clean:
+            added = obs.raise_to[action] - obs.my_bet
+            called = obs.raise_to[action] - obs.opp_bet
+            value = _raise_value(obs, memory, eq, f2b * 0.6, added, called)
+            if value > best_value:
+                best_value, best = value, action
+        if best is not None:
+            return _mark_bet(memory, best)
     slack = 0.03 if obs.street != Street.RIVER else 0.0
     if aggro > 0.62:
         slack += 0.04
